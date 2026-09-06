@@ -38,7 +38,7 @@ from depth_anything_3.utils.io.output_processor import OutputProcessor
 from depth_anything_3.utils.logger import logger
 from depth_anything_3.utils.pose_align import align_poses_umeyama
 
-from utils import process_mono_sky_estimation_np
+from depth_anything_3.utils.process_sky import process_mono_sky_estimation_np
 
 torch.backends.cudnn.benchmark = False
 # logger.info("CUDNN Benchmark Disabled")
