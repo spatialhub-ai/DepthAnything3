@@ -409,7 +409,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         translations = c2ws[..., :3, 3]
         dists = np.linalg.norm(translations, axis=-1)
         median_dist = np.median(dists)
-        median_dist = np.clip(median_dist, min=1e-1, a_max=None)
+        median_dist = np.clip(median_dist, 1e-1, None)
         ex_t_norm[..., :3, 3] = ex_t_norm[..., :3, 3] / median_dist
         return ex_t_norm
 
