@@ -61,6 +61,10 @@ def select_reference_view(
     # Extract and normalize class tokens (first token of each view)
     img_class_feat = x[:, :, 0] / x[:, :, 0].norm(dim=-1, keepdim=True)  # B S C
     
+    # Dynamic view indices (B, S) via cumsum for ONNX dynamic shape tracing
+    view_indices = torch.cumsum(torch.ones_like(x[:, :, 0, 0]), dim=1) - 1.0
+    tie_bias = view_indices * 1e-4
+    
     if strategy == "saddle_balanced":
         # Select view with balanced features across multiple metrics
         # Compute similarity matrix
@@ -75,21 +79,25 @@ def select_reference_view(
         feat_norm = x[:, :, 0].norm(dim=-1)  # B S
         feat_var = img_class_feat.var(dim=-1)  # B S
         
-        # Normalize all metrics to [0, 1]
+        # Normalize all metrics to [0, 1] with safe diff (no denominator bias)
         def normalize_metric(metric):
             min_val = metric.min(dim=1, keepdim=True).values
             max_val = metric.max(dim=1, keepdim=True).values
-            return (metric - min_val) / (max_val - min_val + 1e-8)
+            diff = max_val - min_val
+            safe_diff = torch.where(diff > 1e-6, diff, torch.ones_like(diff))
+            return torch.where(diff > 1e-6, (metric - min_val) / safe_diff, torch.full_like(metric, 0.5))
         
         sim_score_norm = normalize_metric(sim_score)
         norm_norm = normalize_metric(feat_norm)
         var_norm = normalize_metric(feat_var)
         
         # Select view closest to the median (0.5) across all metrics
+        # Add dynamic tie-bias (1e-4) to deterministically prefer earlier indices on ties (e.g. S=2)
         balance_score = (
             (sim_score_norm - 0.5).abs() +
             (norm_norm - 0.5).abs() +
-            (var_norm - 0.5).abs()
+            (var_norm - 0.5).abs() +
+            tie_bias
         )
         b_idx = balance_score.argmin(dim=1)
         
@@ -100,7 +108,9 @@ def select_reference_view(
         
         sim_max = sim_no_diag.max(dim=-1).values  # B S
         sim_min = sim_no_diag.min(dim=-1).values  # B S
-        sim_range = sim_max - sim_min
+        
+        # Subtract dynamic tie-bias (1e-4) prioritizing earlier view indices on exact ties
+        sim_range = (sim_max - sim_min) - tie_bias
         b_idx = sim_range.argmax(dim=1)
     
     else:
@@ -125,26 +135,13 @@ def reorder_by_reference(
     
     Returns:
         Reordered tensor with reference view at position 0
-    
-    Example:
-        If b_idx = [2] and S = 5 (views [0,1,2,3,4]),
-        result order is [2,0,1,3,4] (ref_idx first, then others in order)
     """
-    B, S = x.shape[0], x.shape[1]
-    
-    # Create position indices: (B, S) where each row is [0, 1, 2, ..., S-1]
-    positions = torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)  # B S
-    
-    # For each position, determine which original index it should take
-    # Position 0 gets ref_idx
-    # Position 1 to ref_idx gets indices 0 to ref_idx-1
-    # Position ref_idx+1 to S-1 gets indices ref_idx+1 to S-1
+    # Create position indices dynamically: (B, S) with [0, 1, 2, ..., S-1]
+    positions = torch.cumsum(torch.ones_like(x[:, :, 0, 0], dtype=torch.long), dim=1) - 1
     
     b_idx_expanded = b_idx.unsqueeze(1)  # B 1
     
     # Create the reordering indices
-    # For positions 1 to ref_idx: map to indices 0 to ref_idx-1 (shift by -1)
-    # For positions > ref_idx: keep the same
     reorder_indices = positions.clone()
     reorder_indices = torch.where(
         (positions > 0) & (positions <= b_idx_expanded),
@@ -154,8 +151,8 @@ def reorder_by_reference(
     # Set position 0 to ref_idx
     reorder_indices = torch.where(positions == 0, b_idx_expanded, reorder_indices)
     
-    # Gather using advanced indexing
-    batch_indices = torch.arange(B, device=x.device).unsqueeze(1)  # B 1
+    # Gather using dynamic batch indices
+    batch_indices = torch.cumsum(torch.ones_like(x[:, 0, 0, 0], dtype=torch.long), dim=0).unsqueeze(1) - 1
     x_reordered = x[batch_indices, reorder_indices]
     
     return x_reordered
@@ -174,21 +171,9 @@ def restore_original_order(
     
     Returns:
         Tensor with original view order restored
-    
-    Example:
-        If original order was [0, 1, 2, 3, 4] and b_idx=2,
-        reordered becomes [2, 0, 1, 3, 4] (reference at position 0),
-        restore should return [0, 1, 2, 3, 4] (original order).
     """
-    B, S = x.shape[0], x.shape[1]
-    
-    # Create target position indices: (B, S) where each row is [0, 1, 2, ..., S-1]
-    target_positions = torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)  # B S
-    
-    # For each target position, determine which current position it comes from
-    # Target position 0 to ref_idx-1 <- Current position 1 to ref_idx (shift by +1)
-    # Target position ref_idx <- Current position 0
-    # Target position ref_idx+1 to S-1 <- Current position ref_idx+1 to S-1 (no change)
+    # Create target position indices dynamically: (B, S) with [0, 1, 2, ..., S-1]
+    target_positions = torch.cumsum(torch.ones_like(x[:, :, 0, 0], dtype=torch.long), dim=1) - 1
     
     b_idx_expanded = b_idx.unsqueeze(1)  # B 1
     
@@ -199,15 +184,14 @@ def restore_original_order(
         target_positions        # Positions after ref_idx stay the same
     )
     # Target position = ref_idx comes from current position 0
-    # Use scatter to set specific positions
     restore_indices = torch.where(
         target_positions == b_idx_expanded,
         torch.zeros_like(target_positions),
         restore_indices
     )
     
-    # Gather using advanced indexing
-    batch_indices = torch.arange(B, device=x.device).unsqueeze(1)  # B 1
+    # Gather using dynamic batch indices
+    batch_indices = torch.cumsum(torch.ones_like(x[:, 0, 0, 0], dtype=torch.long), dim=0).unsqueeze(1) - 1
     x_restored = x[batch_indices, restore_indices]
     
     return x_restored
