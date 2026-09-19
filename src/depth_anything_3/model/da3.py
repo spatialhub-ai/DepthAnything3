@@ -318,17 +318,17 @@ class NestedDepthAnything3Net(nn.Module):
         second_preset: Configuration for the metric depth branch
     """
 
-    def __init__(self, anyview: DictConfig, metric: DictConfig):
+    def __init__(self, anyview: DictConfig | nn.Module, metric: DictConfig | nn.Module):
         """
         Initialize NestedDepthAnything3Net with two branches.
 
         Args:
-            preset: Configuration for main depth estimation branch
-            second_preset: Configuration for metric depth branch
+            anyview: Configuration or module for main depth estimation branch
+            metric: Configuration or module for metric depth branch
         """
         super().__init__()
-        self.da3 = create_object(anyview)
-        self.da3_metric = create_object(metric)
+        self.da3 = anyview if isinstance(anyview, nn.Module) else create_object(anyview)
+        self.da3_metric = metric if isinstance(metric, nn.Module) else create_object(metric)
 
     def forward(
         self,
