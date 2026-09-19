@@ -422,19 +422,48 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         ransac_view_thresh: int = 10,
     ) -> Prediction:
         """Align depth map to input extrinsics"""
-        if extrinsics is None:
+        if extrinsics is None or prediction.extrinsics is None:
             return prediction
-        prediction.intrinsics = intrinsics.numpy()
-        _, _, scale, aligned_extrinsics = align_poses_umeyama(
-            prediction.extrinsics,
-            extrinsics.numpy(),
-            ransac=len(extrinsics) >= ransac_view_thresh,
-            return_aligned=True,
-            random_state=42,
-        )
+        ext_np = extrinsics.cpu().numpy() if isinstance(extrinsics, torch.Tensor) else np.asarray(extrinsics)
+        int_np = intrinsics.cpu().numpy() if isinstance(intrinsics, torch.Tensor) else (np.asarray(intrinsics) if intrinsics is not None else None)
+        prediction.intrinsics = int_np
+
+        n_views = len(ext_np)
+        if n_views == 1:
+            if align_to_input_ext_scale:
+                prediction.extrinsics = ext_np[..., :3, :]
+            return prediction
+
+        if n_views == 2:
+            c2w_gt = affine_inverse_np(ext_np)
+            c2w_pred = affine_inverse_np(prediction.extrinsics)
+            t_gt_dist = float(np.linalg.norm(c2w_gt[1, :3, 3] - c2w_gt[0, :3, 3]))
+            t_pred_dist = float(np.linalg.norm(c2w_pred[1, :3, 3] - c2w_pred[0, :3, 3]))
+
+            if align_to_input_ext_scale:
+                prediction.extrinsics = ext_np[..., :3, :]
+                if t_gt_dist > 1e-4 and t_pred_dist > 1e-4:
+                    scale = t_pred_dist / t_gt_dist
+                    if abs(scale) > 1e-6:
+                        prediction.depth = prediction.depth / np.float32(scale)
+            return prediction
+
+        try:
+            _, _, scale, aligned_extrinsics = align_poses_umeyama(
+                prediction.extrinsics,
+                ext_np,
+                ransac=n_views >= ransac_view_thresh,
+                return_aligned=True,
+                random_state=42,
+            )
+        except Exception as err:
+            logger.warning(f"Umeyama alignment skipped: {err}")
+            return prediction
+
         if align_to_input_ext_scale:
-            prediction.extrinsics = extrinsics[..., :3, :].numpy()
-            prediction.depth /= scale
+            prediction.extrinsics = ext_np[..., :3, :]
+            if scale is not None and abs(scale) > 1e-6:
+                prediction.depth = prediction.depth / np.float32(scale)
         else:
             prediction.extrinsics = aligned_extrinsics
         return prediction
